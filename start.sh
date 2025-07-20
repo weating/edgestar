@@ -1,88 +1,96 @@
 #!/bin/bash
 
-# --- 配置 ---
+# --- Configuration ---
 # 模型在您服务器上的本地路径
 MODEL_PATH="/home/u2021110842/Qwen2.5-7B-Instruct"
+
 # 您的主业务逻辑脚本路径
-SCRIPT_PATH="/home/u2021110842/autodl-tmp/edge-star-test/infer-new-dataset.py"
+SCRIPT_PATH="/home/u2021110842/autodl-tmp/edge-star-test/single-infer.py"
+
+# <<< 修改: 在此处定义数据文件路径
+INPUT_FILE="/home/u2021110842/autodl-tmp/BGPAgent/20250211data/new_dataset.txt"
+AS_DB_FILE="/home/u2021110842/autodl-tmp/BGPAgent/20250211data/asn_organization_mapping.json"
+
 # 日志和进程ID文件的存放目录
 LOG_DIR="vllm_logs"
 PID_FILE="pids.txt"
+
 # vLLM服务暴露的模型名称
 SERVED_NAME="qwen2.5-7b"
-# 要启动的服务实例数量 (GPU数量)
-NUM_GPUS=4
 
-# --- 脚本正文 ---
+# --- Single-GPU Setup ---
+# 明确指定端口和使用的GPU ID
+PORT=8000
+GPU_ID=0
 
-# 创建日志目录
+
+# --- 脚本正文 (VLLM启动部分无变化) ---
+
+echo "--- Starting VLLM Service Setup ---"
 mkdir -p $LOG_DIR
-echo "Starting VLLM services..."
-
-# 清空旧的PID文件
+echo "Log directory is set to: $LOG_DIR"
 > $PID_FILE
+echo "Old PID file cleared."
+echo "Launching vLLM on GPU $GPU_ID, Port $PORT..."
 
-# 循环启动多个vLLM实例
-for i in $(seq 0 $((3)))
-do
-    PORT=$((8000 + i))
-    echo "Launching vLLM on GPU $i, Port $PORT..."
-    
-    # 使用nohup在后台启动vLLM服务，并将日志重定向
-    CUDA_VISIBLE_DEVICES=$i nohup python -m vllm.entrypoints.openai.api_server \
-        --model "$MODEL_PATH" \
-        --served-model-name "$SERVED_NAME" \
-        --port "$PORT" \
-        --trust-remote-code \
-        --dtype auto \
-        --tensor-parallel-size 1 \
-        --gpu-memory-utilization 0.80 \
-        --max-model-len 32768 > "$LOG_DIR/vllm_gpu${i}.log" 2>&1 &
-    
-    # 将新启动的进程ID记录到文件
-    echo $! >> $PID_FILE
-done
+CUDA_VISIBLE_DEVICES=$GPU_ID nohup python -m vllm.entrypoints.openai.api_server \
+    --model "$MODEL_PATH" \
+    --served-model-name "$SERVED_NAME" \
+    --port "$PORT" \
+    --trust-remote-code \
+    --dtype auto \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.80 \
+    --max-model-len 32768 > "$LOG_DIR/vllm_gpu_${GPU_ID}.log" 2>&1 &
+
+VLLM_PID=$!
+echo $VLLM_PID >> $PID_FILE
+echo "VLLM service started with PID: $VLLM_PID. Log file: $LOG_DIR/vllm_gpu_${GPU_ID}.log"
 
 echo "-----------------------------------------------------"
-echo "Waiting for all $NUM_GPUS vLLM services to become ready..."
-ALL_READY=false
+echo "Waiting for the VLLM service to become ready..."
 TOTAL_WAIT_SECONDS=0
 MAX_WAIT_SECONDS=300
 
-# 循环检查所有vLLM服务的健康状态
-while [ "$ALL_READY" = false ]; do
-    READY_COUNT=0
-    # 精确地检查已启动的服务
-    for i in $(seq 0 $((3))); do
-        PORT=$((8000 + i))
-        # 使用curl检查/health端点，--fail使其在失败时返回非零退出码
-        if curl --silent --fail http://localhost:$PORT/health > /dev/null; then
-            ((READY_COUNT++))
-        fi
-    done
-
-    # 当就绪的服务数量等于我们启动的总数时，认为全部准备就绪
-    if [ "$READY_COUNT" -eq "$NUM_GPUS" ]; then
-        ALL_READY=true
-        echo "All $NUM_GPUS vLLM services are up and running!"
+# Health check loop for the single service instance
+while true; do
+    # Use curl to check the /health endpoint. --fail makes it return an error code on failure.
+    if curl --silent --fail http://localhost:$PORT/health > /dev/null; then
+        echo "VLLM service on port $PORT is up and running!"
+        break
     else
-        echo "$READY_COUNT/$NUM_GPUS services ready. Waiting 5 more seconds..."
         sleep 5
         TOTAL_WAIT_SECONDS=$((TOTAL_WAIT_SECONDS + 5))
-        # 超时检查
+        # Timeout check
         if [ "$TOTAL_WAIT_SECONDS" -gt "$MAX_WAIT_SECONDS" ]; then
-            echo "Error: Timed out waiting for vLLM services to start. Please check the logs in '$LOG_DIR'."
+            echo "Error: Timed out waiting for the VLLM service to start."
+            echo "Please check the log: '$LOG_DIR/vllm_gpu_${GPU_ID}.log'"
+            # Optional: kill the failed process before exiting
+            kill $VLLM_PID
             exit 1
         fi
+        echo "Service not ready yet. Waited $TOTAL_WAIT_SECONDS seconds..."
     fi
 done
 echo "-----------------------------------------------------"
 
 # --- 启动主脚本 ---
-echo "Starting main Python script..."
-nohup python "$SCRIPT_PATH" > "$LOG_DIR/main_script.log" 2>&1 &
-echo $! >> $PID_FILE
+echo "Starting main Python inference script..."
+
+# <<< 核心修改: 调用Python脚本时，传入新增的文件路径参数
+nohup python "$SCRIPT_PATH" \
+    --model-name "$SERVED_NAME" \
+    --port "$PORT" \
+    --input-file "$INPUT_FILE" \
+    --as-info-db "$AS_DB_FILE" > "$LOG_DIR/main_script.log" 2>&1 &
+
+# 记录主脚本的PID
+SCRIPT_PID=$!
+echo $SCRIPT_PID >> $PID_FILE
+echo "Main script started with PID: $SCRIPT_PID. Log file: $LOG_DIR/main_script.log"
+echo "-----------------------------------------------------"
 
 echo "All processes started successfully."
 echo "You can now safely close this terminal."
-echo "To stop all processes, run a command like: kill \$(cat pids.txt)"
+echo "To monitor logs, use commands like: tail -f $LOG_DIR/main_script.log"
+echo "To stop all processes, run the command: kill \$(cat $PID_FILE)"
